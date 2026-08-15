@@ -293,13 +293,28 @@ jobs:
     # Delete the luma assertion and this job stops testing the thing it was
     # written for while still going green.
     runs-on: ubuntu-latest
-    env:
-      PROJ: ${{ runner.temp }}/render-check
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # PROJ is exported through $GITHUB_ENV rather than declared in a
+      # job-level `env:` block, and both of the obvious alternatives are wrong:
+      #
+      #   env: PROJ: ${{ runner.temp }}/...  -- the `runner` context is not
+      #     available where a job-level env block is evaluated. GitHub rejects
+      #     the WHOLE workflow file for it: the run fails in 0s with no logs,
+      #     and the workflow's name reads as its own path.
+      #   env: PROJ: ${RUNNER_TEMP}/...      -- accepted, and useless. GitHub
+      #     passes env values through literally, and a shell does not re-expand
+      #     the contents of a variable, so every step would build a directory
+      #     named `${RUNNER_TEMP}` on disk and then quietly use it.
+      #
+      # Writing to $GITHUB_ENV runs the expansion in a real shell and hands the
+      # resolved path to every later step.
+      - name: Locate the scratch project
+        run: echo "PROJ=$RUNNER_TEMP/render-check" >> "$GITHUB_ENV"
 
       - name: Install ffmpeg
         run: |
@@ -406,7 +421,7 @@ jobs:
       # above. That it exited 0 is what got us this far; from here the only
       # evidence that counts is measured off the delivered file.
       - name: Assert the delivered file
-        working-directory: ${{ runner.temp }}/render-check
+        working-directory: ${{ runner.temp }}/render-check  # step level: runner IS available here
         run: |
           python - <<'PY'
           import json
