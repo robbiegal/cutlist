@@ -1,0 +1,51 @@
+# Written BEFORE `git init`, deliberately. A video project's working directory
+# is mostly media and rendered evidence; a single `git add -A` without this file
+# commits gigabytes, and in the project this tool was extracted from it would
+# also have committed unredacted licence plates and a device PIN.
+
+# --- media, in and out -------------------------------------------------------
+media/
+source/
+_cut/
+_out/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.m4v
+*.avi
+*.wav
+*.mp3
+*.aac
+*.flac
+
+# Except the synthetic fixtures the tests generate/keep. They are tiny, carry no
+# identity, and are produced by ffmpeg lavfi sources rather than filmed.
+!tests/fixtures/**
+
+# --- generated NLE / intermediate project files ------------------------------
+# These embed absolute paths, and therefore the author's home directory.
+*.kdenlive
+*.mlt
+*.edl
+*.fcpxml
+*.otio
+
+# --- python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- agent / editor state ----------------------------------------------------
+# Session state files carry usernames, transcript paths and cost telemetry.
+.omc/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db

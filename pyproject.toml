@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cutlist"
+version = "0.1.0"
+description = "Assemble, grade, redact, mix and verify a video from a declarative cut list, using ffmpeg."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Robbie Galfrin" }]
+keywords = ["video", "ffmpeg", "editing", "redaction", "post-production"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+]
+
+# Deliberately zero hard dependencies. The whole band-1 engine -- ingest,
+# conform, shot, assemble, grade, redaction, audio and every verification
+# instrument -- is stdlib plus ffmpeg. A config can be JSON (stdlib) or TOML
+# (stdlib on 3.11+), so even PyYAML is optional; the loader picks by extension
+# and raises with the exact pip line if a .yaml is handed to it without it.
+#
+# This is what lets the test suite and CI run in seconds on a machine that has
+# never downloaded a browser, and it is the difference between a plugin a
+# stranger can install and one they give up on.
+dependencies = []
+
+[project.optional-dependencies]
+# Config files written as YAML. JSON and TOML need nothing.
+yaml = ["PyYAML>=6.0"]
+
+# Band 2: static text. Pillow bundles FreeType on all three platforms, so a
+# title card needs neither a libfreetype-enabled ffmpeg build (the Kdenlive-
+# bundled Windows build does not have one) nor a 150 MB browser.
+text = ["Pillow>=10"]
+
+# Band 3: animated motion graphics. Pinned, because the Chromium build -- and
+# therefore text shaping and therefore every overlay's layout -- is tied to the
+# playwright version. Its browser is a separate ~150 MB download.
+graphics = ["playwright>=1.49,<2"]
+
+dev = ["pytest>=8", "ruff>=0.6"]
+all = ["PyYAML>=6.0", "Pillow>=10", "playwright>=1.49,<2", "pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+cutlist = "cutlist.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/robbiegal/cutlist"
+Issues = "https://github.com/robbiegal/cutlist/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# Prompts, templates and the lessons ledger live inside the package and ship
+# with the wheel. Resolving them by walking up from __file__ works in an
+# editable checkout and fails silently in a wheel, where the module sits in
+# site-packages and the repo layout does not exist.
+cutlist = ["prompts/*.md", "references/*.md", "templates/*.yaml", "templates/*.json", "*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

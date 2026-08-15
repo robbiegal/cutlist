@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "cutlist",
+  "displayName": "Cutlist",
+  "version": "0.1.0",
+  "description": "Cut, grade, annotate, redact and mix a finished video from raw footage with ffmpeg, and prove the result frame by frame instead of trusting the exit code.",
+  "author": {
+    "name": "Robbie Galfrin",
+    "url": "https://github.com/robbiegal"
+  },
+  "homepage": "https://github.com/robbiegal/cutlist#readme",
+  "repository": "https://github.com/robbiegal/cutlist",
+  "license": "MIT",
+  "keywords": [
+    "video",
+    "video-editing",
+    "ffmpeg",
+    "montage",
+    "redaction",
+    "motion-graphics",
+    "post-production"
+  ]
+}

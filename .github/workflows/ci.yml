@@ -1,0 +1,527 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# Only the newest run for a ref can still be telling the truth. A second push
+# replaces the tree the earlier run was measuring, so its verdict -- pass or
+# fail -- is about code that no longer exists. Cancelling also frees the one
+# job here that actually renders video for the run whose answer matters.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing in this workflow writes to the repository. Declared rather than
+# inherited, so a job added later has to ask for more on purpose.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  lint-test:
+    name: lint+test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # WHY not fail-fast: a Windows-only path bug is precisely what this
+      # matrix exists to find, and cancelling the sibling legs the moment one
+      # fails hides whether the failure is platform-specific or universal --
+      # which is the first question anyone asks.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # WHY no ffmpeg in this job: the package has zero hard dependencies and
+      # reaches the toolchain only at render time. Importing, linting and unit
+      # testing must therefore all work on a machine that has never seen
+      # ffmpeg. If a test starts needing it, that test belongs in
+      # ffmpeg-render -- and this job going red is how that gets noticed
+      # instead of quietly becoming a hidden requirement for contributors.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,text]"
+
+      - name: ruff
+        run: ruff check .
+
+      # `pytest -q` exits non-zero when the suite is missing or collects
+      # nothing, and that is wanted rather than tolerated: a green build on
+      # zero tests is the most expensive kind of false confidence.
+      - name: pytest
+        run: pytest -q
+
+  # ---------------------------------------------------------------------
+  leak-gate:
+    name: leak-gate
+    # WHY this job exists, and why it is not a pytest case:
+    #
+    #   * Vendoring the toolchain changes this repository's licence
+    #     obligations. ffmpeg is LGPL by default and GPL as commonly built, and
+    #     the moment a tracked file IS one of those binaries the distribution
+    #     as a whole owes a corresponding-source offer. See LICENSING.md. That
+    #     is a property of the committed tree, so the tree is what gets
+    #     checked -- not an import, not a code path.
+    #   * The rest is what leaks out of a video project: a home directory
+    #     baked into a path, a plate-shaped number in an example, a font with
+    #     no licence beside it, a render nobody meant to commit.
+    #
+    # It reads the checkout and nothing else, so it is the fastest signal in
+    # the workflow. That matters: its failures are the cheapest to fix, and
+    # waiting for a render to find out you committed a .mp4 is wasted time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan the tracked tree
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          # -------------------------------------------------- banned strings
+          #
+          # Assembled from fragments, never written as literals.
+          #
+          # WHY: this gate reads every tracked text file, and the workflow it
+          # lives in is one of them. A literal home-directory string here would
+          # make the gate fail on itself -- and the obvious fix, exempting this
+          # file, opens the exact hole the gate exists to close, because the
+          # exempted file becomes the one place a banned string can live
+          # forever. Fragments keep the gate inside its own coverage with no
+          # exemption list at all.
+          BS = chr(92)
+
+          # Runs of backslashes are collapsed to one before matching. WHY: in
+          # every language that matters here a Windows path is written with the
+          # separator DOUBLED -- a Python or JavaScript literal escapes it, and
+          # JSON has no choice about it. So the form a leaked home directory
+          # actually takes in a code fallback is the escaped one, and a scanner
+          # looking only for the single-separator form reports clean on the
+          # exact case it was written to catch. Measured: the first draft of
+          # this gate passed a planted `.py` holding a doubled-separator path.
+          BACKSLASH_RUN = re.compile(re.escape(BS) + "+")
+
+          # Matched against the collapsed line, lowercased: a Windows path gets
+          # typed in both cases and means the same thing either way.
+          WINDOWS_HOME = "c:" + BS + "use" + "rs" + BS
+
+          # Matched as written. Case matters here: the macOS home root is
+          # exactly this, whereas the lowercased spelling is usually a URL path
+          # and flagging those is how a check earns its reputation for noise.
+          # A Windows path typed with forward slashes is caught by the first of
+          # these as well, which is why it is not listed separately.
+          POSIX_HOMES = ["/Use" + "rs/", "/ho" + "me/"]
+
+          # A plate-shaped run of digits. Word-bounded on both ends, so it does
+          # not fire on every timestamp, version or coordinate that happens to
+          # contain the same digits. A check that cries wolf gets switched off,
+          # which is indistinguishable from not having one.
+          PLATE = re.compile(r"\b\d{2,3}-\d{2,3}-\d{2,3}\b")
+
+          # ------------------------------------------------------- file rules
+          #
+          # Versioned shared objects are matched too (libfoo.so.60.31.102).
+          # Matching a bare ".so" only is trivially stepped around and the
+          # licence question is identical either way.
+          BINARY = re.compile(r"\.(exe|dll|dylib)$|\.so(\.\d+)*$", re.IGNORECASE)
+
+          # A file NAMED like the toolchain, whatever its extension. Prose
+          # about ffmpeg is fine and necessary; a file called `ffmpeg` sitting
+          # in the tree is the thing LICENSING.md forbids.
+          TOOLCHAIN = {"ffmpeg", "ffprobe", "ffplay", "melt", "avconv", "avprobe"}
+          PROSE = {".md", ".txt", ".rst", ".py", ".json", ".yaml", ".yml", ".toml",
+                   ".cfg", ".ini"}
+
+          MEDIA = {".mp4", ".mov", ".mkv", ".wav", ".jpg", ".jpeg", ".png"}
+          FIXTURES = "tests/fixtures/"
+
+          FONTS = {".ttf", ".otf", ".ttc", ".woff", ".woff2", ".pfa", ".pfb"}
+          LICENCE = re.compile(r"licen[cs]e|copying|ofl", re.IGNORECASE)
+
+          SIZE_LIMIT = 512 * 1024
+          # Empty, and it should stay that way. An allowlist is where a large
+          # file goes to become permanent: the entry outlives the reason for
+          # it, and nobody ever removes one. Anything that genuinely has to be
+          # large belongs outside the repository.
+          SIZE_ALLOWLIST = set()
+
+          problems = []
+
+          def bad(where, why):
+              problems.append((where, why))
+
+          out = subprocess.run(["git", "ls-files", "-z"],
+                               capture_output=True, text=True, check=True).stdout
+          files = [f for f in out.split("\0") if f]
+
+          # A gate that scanned nothing must never report clean. If this fires,
+          # the checkout is wrong and every rule below just passed on an empty
+          # set -- which reads exactly like success.
+          if not files:
+              sys.exit("leak-gate: git ls-files returned nothing; "
+                       "refusing to pass on an unscanned tree")
+
+          by_dir = {}
+          for f in files:
+              d, _, n = f.rpartition("/")
+              by_dir.setdefault(d, []).append(n)
+
+          for rel in files:
+              p = Path(rel)
+              name = p.name
+              suffix = p.suffix.lower()
+
+              # 1. Compiled artifacts and toolchain binaries.
+              if BINARY.search(name):
+                  bad(rel, "compiled binary: the toolchain is detected, never "
+                           "vendored -- shipping one changes this repository's "
+                           "licence obligations (LICENSING.md)")
+              if p.stem.lower() in TOOLCHAIN and suffix not in PROSE:
+                  bad(rel, "named like a toolchain binary -- see LICENSING.md")
+
+              # 2. Size. A repository a stranger can clone in seconds is a
+              #    feature; the first large file is what ends that, and it is
+              #    always easier to refuse than to rewrite history later.
+              try:
+                  size = p.stat().st_size
+              except OSError:
+                  size = 0
+              if size > SIZE_LIMIT and rel not in SIZE_ALLOWLIST:
+                  bad(rel, f"{size // 1024} KB exceeds the "
+                           f"{SIZE_LIMIT // 1024} KB limit for a tracked file")
+
+              # 3. Media outside the fixtures directory. Fixtures are generated
+              #    synthetically by lavfi at test time, so they carry no
+              #    identifiable person, place, plate or location metadata.
+              #    Anything else is footage that arrived by accident.
+              if suffix in MEDIA and not rel.startswith(FIXTURES):
+                  bad(rel, f"media outside {FIXTURES}")
+
+              # 4. A font travels with its licence or it does not travel. The
+              #    OFL and most others require the licence text and copyright
+              #    notice to accompany every copy, and a font two directories
+              #    away from its licence is a copy without one.
+              if suffix in FONTS:
+                  d = rel.rpartition("/")[0]
+                  if not any(LICENCE.search(n) for n in by_dir.get(d, [])):
+                      bad(rel, "font file with no licence file beside it")
+
+              # 5. Banned strings, over EVERY tracked file that is not binary --
+              #    deliberately not over a list of extensions. .py, .js, .css,
+              #    .md, .json and .yaml are all in scope, and so is the file
+              #    type nobody thought of.
+              #
+              #    An extension allowlist is itself an escape hatch. A banned
+              #    string surviving in a code fallback literal, rather than in a
+              #    config, is a real way this check gets defeated -- and a .jsx,
+              #    a .env or an extensionless shim would sail past a list that
+              #    only names configs.
+              if suffix in MEDIA or suffix in FONTS or BINARY.search(name):
+                  continue
+              try:
+                  data = p.read_bytes()
+              except OSError:
+                  continue
+              if b"\0" in data:
+                  continue
+              for lineno, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+                  # A function, not a string: re.sub parses a replacement
+                  # string as a template, where a lone backslash is an error.
+                  collapsed = BACKSLASH_RUN.sub(lambda _m: BS, line)
+                  leaked = WINDOWS_HOME in collapsed.lower() or any(
+                      frag in collapsed for frag in POSIX_HOMES
+                  )
+                  if leaked:
+                      bad(f"{rel}:{lineno}",
+                          "home-directory-shaped path: it names whoever built it, "
+                          "and it does not resolve on anyone else's machine")
+                  if PLATE.search(line):
+                      bad(f"{rel}:{lineno}", "plate-shaped number")
+
+          if problems:
+              print(f"leak-gate: {len(problems)} problem(s)\n")
+              for where, why in problems:
+                  print(f"  {where}\n      {why}")
+              sys.exit(1)
+          print(f"leak-gate: clean ({len(files)} tracked files)")
+          PY
+
+  # ---------------------------------------------------------------------
+  plugin-validate:
+    name: plugin-validate
+    # WHY: the plugin manifest, the skills' frontmatter and hooks.json are read
+    # only by someone else's loader. Nothing in the Python test suite touches
+    # them, so without this job a malformed manifest ships and the failure
+    # lands on a stranger installing the plugin, with no line number and no way
+    # to tell which file is wrong.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # The exit code is not the contract here -- the printed verdict is. A
+      # validator that reports problems and still exits 0 would pass this job
+      # in silence, which is the same mistake as trusting ffmpeg's exit code.
+      - name: plugin validate
+        run: |
+          set -o pipefail
+          npx -y @anthropic-ai/claude-code@latest plugin validate . 2>&1 | tee validate.log
+          grep -q "Validation passed" validate.log
+
+  # ---------------------------------------------------------------------
+  ffmpeg-render:
+    name: ffmpeg-render
+    # The only job that renders, and the only one that can catch the failure
+    # every cheap check above is blind to: a pipeline that produces a valid,
+    # correct-looking, entirely black video. The encoder is not lying when it
+    # exits 0 -- it encoded exactly the frames it was handed, and every one of
+    # them was black.
+    #
+    # So: "ffmpeg exited 0" must never be the pass condition in this job. The
+    # pass condition is the measured file -- codec, geometry, frame rate, an
+    # exact frame count computed from the cut list, and a mean luma floor.
+    # Delete the luma assertion and this job stops testing the thing it was
+    # written for while still going green.
+    runs-on: ubuntu-latest
+    env:
+      PROJ: ${{ runner.temp }}/render-check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -n 1
+
+      # No extras. Band 1 is the standard library plus ffmpeg, and a JSON cut
+      # list needs no parser beyond it. If this line ever has to grow before a
+      # plain render works, that claim has quietly stopped being true and the
+      # install instructions everywhere else are wrong.
+      - name: Install cutlist
+        run: pip install .
+
+      # Generated here rather than committed: it keeps the repository small,
+      # and lavfi sources carry no identifiable person, place, plate or
+      # location metadata to leak. testsrc2 is also bright and detailed, which
+      # is what makes the luma floor below a meaningful number rather than a
+      # threshold a grey card would clear.
+      - name: Synthesise the fixture
+        run: |
+          mkdir -p "$PROJ/media"
+          ffmpeg -v error -y \
+            -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=5" \
+            -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=5" \
+            -map 0:v -map 1:a \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+            -c:a aac -shortest \
+            "$PROJ/media/subject.mp4"
+
+      # Every segment declares duration_s even where a clip's in/out already
+      # implies it (the loader requires the two to agree). WHY: it lets the
+      # assertion step compute the expected frame count straight from the cut
+      # list, without asking the engine. An expectation derived from the code
+      # under test agrees with any bug that code contains.
+      #
+      # The timeline covers a colour segment, real footage with a blur
+      # redaction, a hard cut and a dissolve -- the dissolve because the
+      # transition path is where the timebase mismatch documented in
+      # assemble.py lives, and it only appears once shots are joined.
+      - name: Write the cut list
+        run: |
+          cat > "$PROJ/project.json" <<'JSON'
+          {
+            "project": {
+              "name": "rendercheck",
+              "width": 1280,
+              "height": 720,
+              "fps": 30,
+              "media_dir": "media",
+              "out_dir": "_out",
+              "work_dir": "_cut"
+            },
+            "timeline": [
+              {
+                "id": "opening",
+                "duration_s": 1.0,
+                "video_layers": [
+                  { "kind": "color", "value": "#3a3a3a", "z": 0 }
+                ]
+              },
+              {
+                "id": "subject",
+                "duration_s": 3.0,
+                "video_layers": [
+                  { "kind": "clip", "source": "subject.mp4",
+                    "in": 0.5, "out": 3.5, "z": 0, "fit": "contain" }
+                ],
+                "redact": [
+                  { "box": [400, 220, 200, 120], "from": 0.5, "to_s": 2.5,
+                    "mode": "blur", "margin_px": 16 }
+                ],
+                "audio": { "gain_db": -6.0 }
+              },
+              {
+                "id": "tail",
+                "duration_s": 1.0,
+                "transition_in": { "kind": "fade", "duration_s": 0.5 },
+                "video_layers": [
+                  { "kind": "color", "value": "#3a3a3a", "z": 0 }
+                ]
+              }
+            ],
+            "variants": [{ "name": "final" }],
+            "render": {
+              "vcodec": "libx264",
+              "crf": 23,
+              "preset": "veryfast",
+              "acodec": "aac",
+              "abr": "128k"
+            }
+          }
+          JSON
+
+      # Gates on what this config demands, so a failure here names the missing
+      # filter instead of surfacing halfway through a conform.
+      - name: doctor
+        run: cutlist doctor --config "$PROJ/project.json"
+
+      - name: build
+        run: cutlist build --config "$PROJ/project.json" --variant final
+
+      # The pass condition. Note what is absent: the exit code of the step
+      # above. That it exited 0 is what got us this far; from here the only
+      # evidence that counts is measured off the delivered file.
+      - name: Assert the delivered file
+        working-directory: ${{ runner.temp }}/render-check
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          # Well above black and well below any real picture. A deliberately
+          # dark, moody grade still measures far above this, so the floor flags
+          # a broken render rather than a dark style.
+          LUMA_FLOOR = 24.0
+
+          cfg = json.loads(Path("project.json").read_text(encoding="utf-8"))
+          proj = cfg["project"]
+
+          # Computed from the cut list, not from anything the engine wrote. A
+          # transition OVERLAPS its two shots, so the finished timeline is
+          # shorter than the sum of its segments by the total transition time.
+          total = sum(s["duration_s"] for s in cfg["timeline"])
+          overlap = sum(
+              s["transition_in"]["duration_s"]
+              for s in cfg["timeline"][1:]
+              if s.get("transition_in", {}).get("kind", "cut") != "cut"
+          )
+          expected_frames = round((total - overlap) * proj["fps"])
+
+          delivered = Path(proj["out_dir"]) / f"{proj['name']}_final.mp4"
+          if not delivered.is_file():
+              sys.exit(f"FAIL  no delivered file at {delivered}")
+
+          def ffprobe(*args):
+              r = subprocess.run(["ffprobe", "-v", "error", *args],
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  sys.exit(f"FAIL  ffprobe: {r.stderr.strip()}")
+              return r.stdout.strip()
+
+          meta = json.loads(ffprobe("-show_streams", "-print_format", "json",
+                                    str(delivered)))
+          v = next((s for s in meta["streams"] if s["codec_type"] == "video"), None)
+          a = next((s for s in meta["streams"] if s["codec_type"] == "audio"), None)
+          if v is None:
+              sys.exit("FAIL  the delivered file has no video stream")
+
+          # Counted, not read off the header. A container's frame count is a
+          # claim; -count_frames decodes and reports what is actually there,
+          # which is the difference between catching a truncated encode and
+          # believing its metadata.
+          counted = ffprobe("-count_frames", "-select_streams", "v:0",
+                            "-show_entries", "stream=nb_read_frames",
+                            "-of", "csv=p=0", str(delivered))
+
+          # Mean luma over every frame, written straight to a file by the
+          # metadata filter. WHY the file and not the log: the same numbers
+          # reach the log only at -loglevel info, so measuring at a quieter
+          # level runs the filter, prints nothing, and silently downgrades this
+          # to "no data" -- which is exactly the black render it exists to
+          # catch, going unnoticed.
+          subprocess.run(
+              ["ffmpeg", "-v", "error", "-i", str(delivered), "-vf",
+               "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=luma.txt",
+               "-f", "null", "-"],
+              check=True,
+          )
+          vals = [
+              float(line.split("=", 1)[1])
+              for line in Path("luma.txt").read_text(encoding="utf-8").splitlines()
+              if "YAVG=" in line
+          ]
+
+          report = json.loads(
+              Path(proj["work_dir"], "report.json").read_text(encoding="utf-8")
+          )
+
+          checks = []
+
+          def check(name, ok, expected, actual):
+              checks.append((name, bool(ok), expected, actual))
+
+          check("codec", v.get("codec_name") == "h264", "h264", v.get("codec_name"))
+          check("geometry",
+                (v.get("width"), v.get("height")) == (proj["width"], proj["height"]),
+                f"{proj['width']}x{proj['height']}",
+                f"{v.get('width')}x{v.get('height')}")
+          rate = f"{int(proj['fps'])}/1"
+          check("frame rate", v.get("r_frame_rate") == rate, rate, v.get("r_frame_rate"))
+          check("audio", a is not None and a.get("codec_name") == "aac",
+                "aac", a.get("codec_name") if a else "absent")
+          check("frame count", counted == str(expected_frames), expected_frames, counted)
+          # Three-way: the cut list says one number, the engine's report says
+          # one, and the file contains one. Two of the three agreeing is how a
+          # frame-count bug hides.
+          check("engine agrees on frames", report.get("frames") == expected_frames,
+                expected_frames, report.get("frames"))
+
+          # An assertion that could not run is not a pass. Silence there reads
+          # as "no problems found", which is the worst thing a verification step
+          # can say -- so an unmeasured luma fails this job outright.
+          check("luma measured", bool(vals), "at least one frame", len(vals))
+          mean = (sum(vals) / len(vals)) if vals else -1.0
+          check("not black", mean >= LUMA_FLOOR, f">= {LUMA_FLOOR}", round(mean, 2))
+
+          assertions = report.get("assertions", [])
+          not_run = [x["name"] for x in assertions if not x.get("ran", True)]
+          failed = [x["name"] for x in assertions
+                    if x.get("ran", True) and not x.get("passed")]
+          check("engine assertions ran", not not_run, "all ran", not_run or "all ran")
+          check("engine assertions passed", not failed, "all passed",
+                failed or "all passed")
+
+          for name, ok, expected, actual in checks:
+              print(f"{'ok  ' if ok else 'FAIL'}  {name}: "
+                    f"expected {expected}, got {actual}")
+          losers = [c for c in checks if not c[1]]
+          if losers:
+              sys.exit(f"\n{len(losers)} assertion(s) failed on the delivered file.")
+          print(f"\n{delivered} matches the cut list.")
+          PY

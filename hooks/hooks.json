@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/preflight.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

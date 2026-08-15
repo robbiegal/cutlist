@@ -1,0 +1,20 @@
+cutlist
+Copyright (c) 2026 Robbie Galfrin
+
+This product invokes third-party software that it does not include and does not
+distribute:
+
+  ffmpeg / ffprobe  -- https://ffmpeg.org
+                       LGPL-2.1-or-later, or GPL-2.0-or-later when built with
+                       --enable-gpl. Installed by the user; called as a separate
+                       process over its documented command-line interface.
+
+Optional Python dependencies, installed on demand and each under its own
+licence:
+
+  Pillow            -- MIT-CMU
+  playwright        -- Apache-2.0 (downloads a Chromium build under BSD-3-Clause
+                       and the licences listed in that build)
+  PyYAML            -- MIT
+
+No font files are distributed with this software. See LICENSING.md.

@@ -1,0 +1,119 @@
+#!/bin/sh
+# cutlist -- launcher shim.
+#
+# The plugin's bin/ directory is placed on the Bash tool's PATH while the
+# plugin is enabled, so `cutlist ...` in any Bash call resolves here. This
+# file's entire job is to find the interpreter that has cutlist installed and
+# hand off to it.
+#
+# It has to be SELF-LOCATING, and that is the part that is not obvious.
+# CLAUDE_PLUGIN_ROOT and CLAUDE_PLUGIN_DATA are exported to hook and MCP
+# subprocesses only; in an ordinary Bash tool call they are EMPTY. A shim that
+# reads them and gives up is a shim that works when a hook runs it and fails
+# when a person does -- the hardest shape of bug to reproduce, because the two
+# cases look identical from the outside.
+#
+# The search order below is duplicated in venv_home() in
+# scripts/cutlist_env.py, and read a third time by scripts/preflight.sh. The
+# three MUST agree: the installer decides where an environment is created, this
+# shim decides which one runs, and if they disagree then `install` reports
+# success while `cutlist` keeps running a different one -- or none.
+#
+# POSIX sh only. No bashisms: this runs under whatever /bin/sh happens to be,
+# including dash and BusyBox, where [[ ]], arrays and ${var,,} are syntax
+# errors rather than portability warnings.
+set -eu
+
+# Both venv layouts are tried, in this order, everywhere. POSIX venvs put the
+# interpreter in venv/bin; Windows venvs put it in venv/Scripts. Trying both on
+# both platforms costs one stat and covers the case that actually bites -- a
+# POSIX shell session running on Windows, where only the Scripts layout exists.
+find_python() {
+    if [ -f "$1/venv/bin/python" ]; then
+        printf '%s\n' "$1/venv/bin/python"
+        return 0
+    fi
+    if [ -f "$1/venv/Scripts/python.exe" ]; then
+        printf '%s\n' "$1/venv/Scripts/python.exe"
+        return 0
+    fi
+    return 1
+}
+
+# Handing off with `python -m cutlist.cli` rather than running the venv's
+# `cutlist` console script: a console script embeds an absolute shebang written
+# at install time, so it stops working the moment the data directory is moved
+# or the environment is rebuilt underneath it. `-m` has no such dependency.
+run() {
+    py=$1
+    shift
+    exec "$py" -m cutlist.cli "$@"
+}
+
+not_found() {
+    printf '%s\n' "cutlist: no cutlist environment found." >&2
+    printf '%s\n' "cutlist: searched CUTLIST_HOME, CLAUDE_PLUGIN_DATA, and" >&2
+    printf '%s\n' "cutlist:   \$HOME/.claude/plugins/data/cutlist*" >&2
+    printf '%s\n' "cutlist: run /cutlist:cutlist-doctor to set one up." >&2
+    # 127 is the conventional "command not found", and it is deliberately
+    # outside the CLI's own exit contract (0 ok, 1 error, 2 verification
+    # failed). A caller gating on 2 must never see this shim's failure to find
+    # an interpreter reported as a failed verification.
+    exit 127
+}
+
+# --- 1. CUTLIST_HOME: an explicit override ---------------------------------
+#
+# Set-but-holding-nothing is a hard error, never a fallback. Ranking past a
+# broken override silently runs a DIFFERENT environment than the one that was
+# pinned, and nothing in the output says so -- the operator sees the version
+# they did not choose and has no way to tell why. The same rule governs
+# CUTLIST_FFMPEG inside the package, for the same reason.
+if [ -n "${CUTLIST_HOME:-}" ]; then
+    if py=$(find_python "$CUTLIST_HOME"); then
+        run "$py" "$@"
+    fi
+    printf '%s\n' "cutlist: CUTLIST_HOME is set to '$CUTLIST_HOME', which holds no cutlist environment." >&2
+    printf '%s\n' "cutlist: refusing to fall back to a different one -- a pin that quietly runs" >&2
+    printf '%s\n' "cutlist: something else is worse than no pin. Unset it, or run" >&2
+    printf '%s\n' "cutlist: /cutlist:cutlist-doctor to install one there." >&2
+    exit 127
+fi
+
+# --- 2. CLAUDE_PLUGIN_DATA -------------------------------------------------
+#
+# Unlike CUTLIST_HOME, an unusable value here falls through rather than
+# failing. This variable is the harness's answer to "where does this plugin
+# keep its data", not an operator's pin, and it is set in some contexts and not
+# others -- so its absence, or its pointing at a directory before anything has
+# been installed into it, is ordinary rather than a mistake to report.
+if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+    if py=$(find_python "$CLAUDE_PLUGIN_DATA"); then
+        run "$py" "$@"
+    fi
+fi
+
+# --- 3. The default location ------------------------------------------------
+#
+# Globbed rather than named: the directory carries a marketplace-dependent
+# suffix that this file cannot know. Normally exactly one matches -- the data
+# directory is stable across plugin updates, which is the whole reason the
+# environment lives there rather than in the version-scoped plugin root.
+#
+# Where several match, the first one that actually holds an environment wins,
+# in the shell's sorted expansion order. Sorted so the answer never depends on
+# directory enumeration order, and "first that holds an environment" so this
+# converges with venv_home() on the same directory whenever there is one to
+# converge on.
+#
+# HOME unset expands to an empty prefix, the glob matches nothing, and the
+# not-found message below is printed. That is the right outcome: there is
+# nowhere left to look.
+for d in "${HOME:-}"/.claude/plugins/data/cutlist*; do
+    [ -d "$d" ] || continue
+    if py=$(find_python "$d"); then
+        run "$py" "$@"
+    fi
+done
+
+not_found
